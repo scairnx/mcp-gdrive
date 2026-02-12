@@ -6,22 +6,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## ⚡ Recent Updates (Feb 12, 2026)
 
-**✅ MAJOR UPDATE: Full OAuth 2.0 Implementation Complete!**
+**✅ MAJOR FIX: Hybrid Authentication - Works with ALL MCP Clients!**
 
 ### What Changed:
-- ✅ **OAuth 2.0 Authorization Server** - Users authenticate with their own Google accounts
-- ✅ **Bearer Token Authentication** - Standard OAuth flow with token validation
-- ✅ **Simplified Architecture** - Removed complex multi-user credential system
-- ✅ **AWS Deployment Working** - Deployed at `35.174.9.35:3000`
-- ✅ **All MCP Clients Supported** - TextQL, Claude Desktop, etc.
+- ✅ **Hybrid Authentication** - Supports BOTH OAuth 2.0 AND pre-authenticated credentials
+- ✅ **Claude Desktop Fixed** - Now works with stdio transport + pre-auth
+- ✅ **TextQL Fixed** - Now works with HTTP transport + OAuth OR pre-auth
+- ✅ **No Configuration Required** - Server auto-detects authentication method
+- ✅ **AWS Deployment Compatible** - Works with both auth methods in cloud
 
-### Why OAuth is Better:
-- **No pre-configuration** - Users authenticate themselves
-- **Scales infinitely** - Any Google user can connect
-- **More secure** - Tokens managed by OAuth flow
-- **Standard MCP pattern** - Follows MCP OAuth specification
+### Authentication Modes:
+**Pre-Authenticated** (Simpler - recommended for local use):
+- One-time setup: `node dist/index.js auth-user scott`
+- MCP clients connect without Bearer tokens
+- Perfect for Claude Desktop, VS Code
 
-See `OAUTH_IMPLEMENTATION.md` for complete details.
+**OAuth 2.0** (Flexible - recommended for cloud/remote):
+- Users authenticate via browser flow
+- Get Bearer token, use `Authorization: Bearer <token>`
+- Perfect for TextQL, cloud deployments, multi-user scenarios
+
+**Both modes work simultaneously!** The server automatically uses whichever authentication is provided.
+
+See below for complete setup instructions.
 
 ---
 
@@ -80,41 +87,87 @@ This is an MCP (Model Context Protocol) server for Google Drive integration. It 
 
 ### Authentication Flow
 
-**Two Modes:**
+**🎯 Hybrid Authentication - Choose What Works Best:**
 
-#### 1. Local Mode (stdio) - Pre-authenticated
-For local MCP clients like Claude Desktop:
-1. **Setup**: `node dist/index.js auth-user <userId>` - Opens browser OAuth flow
-2. **Storage**: Saves credentials to `credentials/user-<userId>.json`
-3. **Runtime**: Server loads pre-authenticated credentials
-4. **MCP Client**: Connects via stdio transport (no Bearer tokens needed)
+The HTTP server (`src/http-server.ts`) supports BOTH authentication methods simultaneously:
 
-**Credential Locations**:
-- `GDRIVE_USER` environment variable specifies which user
-- Default: `credentials/user-default.json`
-- AWS: `mcp-gdrive/users/<userId>` in Secrets Manager
+#### Method 1: Pre-Authenticated Credentials (Simpler ✅ Recommended for local)
 
-#### 2. Remote Mode (HTTP) - Full OAuth 2.0
-For remote MCP clients like TextQL:
-1. **User visits**: `http://server:3000/oauth/authorize`
-2. **Google OAuth**: Browser redirects to Google consent screen
-3. **User grants access**: To their Google Drive
-4. **Callback**: Server receives auth code, exchanges for access token
-5. **User copies token**: From success page
-6. **MCP Client**: Sends `Authorization: Bearer <token>` with each request
-7. **Server validates**: Token with Google on every request
+**Setup once, works forever:**
+```bash
+# Authenticate user "scott"
+node dist/index.js auth-user scott
+```
 
-**OAuth Endpoints**:
-- `GET /oauth/authorize` - Initiates OAuth flow
-- `GET /oauth/callback` - Receives authorization code
+**How it works:**
+1. Opens browser OAuth flow (one time only)
+2. Saves credentials to `credentials/user-scott.json`
+3. HTTP server loads credentials at startup
+4. **No Bearer token needed!** - MCP clients connect directly
+
+**Start HTTP server with pre-auth:**
+```bash
+GDRIVE_USER=scott node dist/src/http-server.js
+# OR set in environment/Docker
+```
+
+**Perfect for:**
+- Claude Desktop (via HTTP mode)
+- Local development
+- Single-user scenarios
+- Simpler configuration
+
+#### Method 2: OAuth 2.0 Bearer Tokens (Flexible ✅ Recommended for cloud)
+
+**User-driven authentication:**
+1. User visits: `https://your-server/oauth/authorize`
+2. Google OAuth consent screen
+3. User grants Google Drive access
+4. Copy access token from success page
+5. MCP client uses: `Authorization: Bearer <token>`
+
+**OAuth Endpoints:**
+- `GET /oauth/authorize` - Start OAuth flow
+- `GET /oauth/callback` - OAuth callback handler
 - `POST /oauth/token` - Token exchange & refresh
 - `GET /.well-known/oauth-protected-resource` - RFC 9728 metadata
 - `GET /.well-known/oauth-authorization-server` - RFC 8414 metadata
 
-**OAuth Keys** (required for both modes):
-- Local: `gcp-oauth.keys.json` in project root
-- AWS: `mcp-gdrive/oauth-keys` in Secrets Manager
-- Download from Google Cloud Console (OAuth Client ID credentials)
+**Perfect for:**
+- TextQL and remote MCP clients
+- Multi-user scenarios
+- Cloud deployments
+- Users authenticating with their own Google accounts
+
+#### How Hybrid Mode Works
+
+The server checks authentication in this order:
+1. **Bearer token** in `Authorization` header → Use OAuth
+2. **Pre-auth credentials** from `GDRIVE_USER` env var → Use pre-auth
+3. **Pre-auth credentials** from `GDRIVE_CREDENTIALS` env var → Use pre-auth
+4. **No auth** → Return error
+
+This means:
+- ✅ TextQL can use OAuth (with Bearer token)
+- ✅ Claude Desktop can use pre-auth (no token needed)
+- ✅ Both work with the same server instance!
+
+#### Stdio Mode (Local Only - index.ts)
+
+For Claude Desktop stdio transport:
+```bash
+# Standard run (uses GDRIVE_USER environment variable)
+GDRIVE_USER=scott node dist/index.js
+```
+
+Stdio mode ONLY supports pre-authenticated credentials (no OAuth).
+
+#### OAuth Keys (Required)
+
+Download OAuth Client ID credentials from Google Cloud Console:
+- Local: Save to `gcp-oauth.keys.json` in project root
+- AWS: Store in `mcp-gdrive/oauth-keys` Secrets Manager
+- Used for BOTH pre-auth setup AND OAuth flow
 
 ## Development Commands
 

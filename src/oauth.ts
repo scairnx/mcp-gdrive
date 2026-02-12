@@ -318,10 +318,11 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
 }
 
 /**
- * OAuth Middleware - Validates Bearer tokens
+ * OAuth Middleware - Validates Bearer tokens (OPTIONAL)
  *
  * Extracts and validates Bearer token from Authorization header
  * Attaches OAuth2Client to request for downstream handlers
+ * If no token present, allows request to continue (hybrid auth mode)
  */
 export async function oauthMiddleware(
   req: Request,
@@ -344,12 +345,11 @@ export async function oauthMiddleware(
 
   // Extract Bearer token
   const authHeader = req.headers.authorization;
+
+  // If no authorization header, allow request to continue (will use pre-auth credentials)
   if (!authHeader) {
-    res.set("WWW-Authenticate", 'Bearer realm="MCP GDrive Server"');
-    return res.status(401).json({
-      error: "unauthorized",
-      error_description: "Authorization header is required"
-    });
+    console.error("No Authorization header - will use pre-authenticated credentials if available");
+    return next();
   }
 
   const parts = authHeader.split(" ");
@@ -385,7 +385,9 @@ export async function oauthMiddleware(
     // Attach authenticated client to request
     (req as any).authClient = oauth2Client;
     (req as any).userId = tokenInfo.email || "authenticated-user";
+    (req as any).authMethod = "oauth";
 
+    console.error(`OAuth authentication successful for: ${tokenInfo.email}`);
     next();
   } catch (error: any) {
     console.error("Token validation error:", error);
