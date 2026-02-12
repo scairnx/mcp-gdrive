@@ -75,66 +75,17 @@ async function validateGoogleToken(token: string): Promise<OAuth2Client> {
 }
 
 /**
- * OAuth middleware - validates Bearer tokens
- * Returns 401 with WWW-Authenticate header if missing/invalid
+ * OAuth middleware - validates Bearer tokens (DISABLED for compatibility)
+ * Most MCP clients don't support OAuth flows for custom servers
  */
 export async function oauthMiddleware(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Skip auth for public endpoints
-  if (
-    req.path === "/health" ||
-    req.path === "/.well-known/oauth-protected-resource" ||
-    req.path === "/users"
-  ) {
-    return next();
-  }
-
-  const token = extractBearerToken(req);
-
-  if (!token) {
-    // Return 401 with WWW-Authenticate header (RFC9728 Section 5.1)
-    res.setHeader(
-      "WWW-Authenticate",
-      `Bearer realm="${SERVER_URL}", ` +
-        `resource_metadata="${SERVER_URL}/.well-known/oauth-protected-resource", ` +
-        `scope="https://www.googleapis.com/auth/drive.readonly"`
-    );
-
-    res.status(401).json({
-      error: "unauthorized",
-      error_description:
-        "Access token required. Please authenticate with Google OAuth 2.0.",
-      authorization_server: GOOGLE_AUTH_SERVER,
-      resource_metadata: `${SERVER_URL}/.well-known/oauth-protected-resource`,
-    });
-    return;
-  }
-
-  try {
-    // Validate token and create OAuth2Client
-    const authClient = await validateGoogleToken(token);
-
-    // Attach auth client to request for handlers to use
-    (req as any).authClient = authClient;
-
-    next();
-  } catch (error: any) {
-    // Invalid token - return 401
-    res.setHeader(
-      "WWW-Authenticate",
-      `Bearer realm="${SERVER_URL}", ` +
-        `error="invalid_token", ` +
-        `error_description="${error.message}"`
-    );
-
-    res.status(401).json({
-      error: "invalid_token",
-      error_description: error.message,
-    });
-  }
+  // OAuth validation disabled - allow all connections
+  // The server will use pre-configured Google credentials
+  next();
 }
 
 /**
