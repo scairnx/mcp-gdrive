@@ -6,15 +6,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## ⚡ Recent Updates (Feb 12, 2026)
 
-**FIXED: MCP server now works with ALL clients!**
+**✅ MAJOR UPDATE: Full OAuth 2.0 Implementation Complete!**
 
-Critical bugs fixed:
-- ✅ SSE transport session management implemented correctly
-- ✅ `.mcp.json` configured for Claude Desktop
-- ✅ Removed dead OAuth code (102 lines)
-- ✅ Message handling via `transport.handlePostMessage()` working
+### What Changed:
+- ✅ **OAuth 2.0 Authorization Server** - Users authenticate with their own Google accounts
+- ✅ **Bearer Token Authentication** - Standard OAuth flow with token validation
+- ✅ **Simplified Architecture** - Removed complex multi-user credential system
+- ✅ **AWS Deployment Working** - Deployed at `35.174.9.35:3000`
+- ✅ **All MCP Clients Supported** - TextQL, Claude Desktop, etc.
 
-See `FIXES_APPLIED.md` and `TESTING_GUIDE.md` for details.
+### Why OAuth is Better:
+- **No pre-configuration** - Users authenticate themselves
+- **Scales infinitely** - Any Google user can connect
+- **More secure** - Tokens managed by OAuth flow
+- **Standard MCP pattern** - Follows MCP OAuth specification
+
+See `OAUTH_IMPLEMENTATION.md` for complete details.
+
+---
+
+## 🚨 Critical AWS Deployment Note
+
+**Docker Platform Issue:**
+When deploying to AWS from Apple Silicon (M1/M2/M3 Macs), you MUST specify the platform:
+
+```bash
+docker build --platform linux/amd64 -t image-name .
+```
+
+**Why:** Docker on Apple Silicon builds ARM64 images by default, but AWS Fargate requires AMD64/x86_64. Without `--platform linux/amd64`, deployment will fail with:
+```
+CannotPullContainerError: image Manifest does not contain descriptor matching platform 'linux/amd64'
+```
+
+**Fixed in:** `scripts/deploy-aws.sh` (automatically builds for correct platform)
 
 ---
 
@@ -30,11 +55,12 @@ This is an MCP (Model Context Protocol) server for Google Drive integration. It 
 
 **MCP Server** (supports both stdio and HTTP transports):
 - Built using `@modelcontextprotocol/sdk` (v1.0.1)
-- **Local mode** (`index.ts`): stdio transport for local MCP clients (Claude Desktop, VS Code)
-- **Remote mode** (`src/http-server.ts`): SSE over HTTP for remote MCP clients (TextQL, cloud deployments)
+- **Local mode** (`index.ts`): stdio transport for local MCP clients (Claude Desktop, VS Code) - uses pre-authenticated credentials
+- **Remote mode** (`src/http-server.ts`): SSE over HTTP with **full OAuth 2.0 server** for remote MCP clients (TextQL, cloud deployments)
 - Implements Google Drive API v3 via `googleapis` library
-- OAuth2 authentication with read-only scope (`drive.readonly`)
-- Shared authentication (`src/auth.ts`) and handlers (`src/handlers.ts`) modules
+- **OAuth 2.0 Authorization Server** (`src/oauth.ts`): Complete implementation with authorization, token exchange, and Bearer token validation
+- OAuth2 authentication with read-only scopes (`drive.readonly`, `drive.metadata.readonly`)
+- Shared handlers (`src/handlers.ts`) for MCP operations
 
 **Request Handlers**:
 1. **ListResourcesRequestSchema**: Paginated listing of Google Drive files (10 per page)
@@ -54,17 +80,41 @@ This is an MCP (Model Context Protocol) server for Google Drive integration. It 
 
 ### Authentication Flow
 
-Two-phase authentication:
-1. **Setup Phase** (`node dist/index.js auth`): Opens browser OAuth flow, saves credentials to `.gdrive-server-credentials.json`
-2. **Runtime Phase**: Loads saved credentials from `GDRIVE_CREDENTIALS_PATH` environment variable
+**Two Modes:**
 
-**Credential Locations** (in priority order):
-- `GDRIVE_CREDENTIALS_PATH` environment variable
-- Default: `../../../.gdrive-server-credentials.json` (relative to dist/)
+#### 1. Local Mode (stdio) - Pre-authenticated
+For local MCP clients like Claude Desktop:
+1. **Setup**: `node dist/index.js auth-user <userId>` - Opens browser OAuth flow
+2. **Storage**: Saves credentials to `credentials/user-<userId>.json`
+3. **Runtime**: Server loads pre-authenticated credentials
+4. **MCP Client**: Connects via stdio transport (no Bearer tokens needed)
 
-**OAuth Keys**:
-- `GDRIVE_OAUTH_PATH` environment variable
-- Default: `../../../gcp-oauth.keys.json` (relative to dist/)
+**Credential Locations**:
+- `GDRIVE_USER` environment variable specifies which user
+- Default: `credentials/user-default.json`
+- AWS: `mcp-gdrive/users/<userId>` in Secrets Manager
+
+#### 2. Remote Mode (HTTP) - Full OAuth 2.0
+For remote MCP clients like TextQL:
+1. **User visits**: `http://server:3000/oauth/authorize`
+2. **Google OAuth**: Browser redirects to Google consent screen
+3. **User grants access**: To their Google Drive
+4. **Callback**: Server receives auth code, exchanges for access token
+5. **User copies token**: From success page
+6. **MCP Client**: Sends `Authorization: Bearer <token>` with each request
+7. **Server validates**: Token with Google on every request
+
+**OAuth Endpoints**:
+- `GET /oauth/authorize` - Initiates OAuth flow
+- `GET /oauth/callback` - Receives authorization code
+- `POST /oauth/token` - Token exchange & refresh
+- `GET /.well-known/oauth-protected-resource` - RFC 9728 metadata
+- `GET /.well-known/oauth-authorization-server` - RFC 8414 metadata
+
+**OAuth Keys** (required for both modes):
+- Local: `gcp-oauth.keys.json` in project root
+- AWS: `mcp-gdrive/oauth-keys` in Secrets Manager
+- Download from Google Cloud Console (OAuth Client ID credentials)
 
 ## Development Commands
 
@@ -157,30 +207,41 @@ Before using this server, complete these steps:
 }
 ```
 
-### TextQL Integration (Remote HTTP)
+### TextQL Integration (Remote HTTP with OAuth)
 
-For remote MCP clients like TextQL, deploy using HTTP mode:
+For remote MCP clients like TextQL:
 
-**Local HTTP Server**:
+**Step 1: Get Access Token**
 ```bash
-# Start HTTP server
-node dist/src/http-server.js
+# Visit authorization URL (replace with your server IP/domain)
+open http://35.174.9.35:3000/oauth/authorize
 
-# Configure TextQL to connect
-# Endpoint: http://localhost:3000/sse
+# Complete Google OAuth consent screen
+# Copy the access token from the success page
 ```
 
-**AWS Cloud Deployment**:
+**Step 2: Configure TextQL**
 ```json
 {
-  "gdrive": {
-    "url": "http://<PUBLIC-IP>:3000/sse",
-    "transport": "sse"
+  "mcpServers": {
+    "gdrive": {
+      "url": "http://35.174.9.35:3000/sse",
+      "transport": "sse",
+      "headers": {
+        "Authorization": "Bearer ya29.a0AfB_by..."
+      }
+    }
   }
 }
 ```
 
-See [DEPLOYMENT_AWS.md](./DEPLOYMENT_AWS.md) for complete AWS deployment guide.
+**Current AWS Deployment**:
+- **Server**: `http://35.174.9.35:3000`
+- **OAuth**: `http://35.174.9.35:3000/oauth/authorize`
+- **Authentication**: OAuth 2.0 Bearer tokens required
+- **Public IP may change**: Check ECS task for current IP
+
+See [OAUTH_IMPLEMENTATION.md](./OAUTH_IMPLEMENTATION.md) and [DEPLOYMENT_AWS.md](./DEPLOYMENT_AWS.md) for details.
 
 ## Security Considerations
 
