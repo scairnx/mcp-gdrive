@@ -76,13 +76,15 @@ async function createOAuthClient(req: Request): Promise<OAuth2Client> {
 /**
  * OAuth Protected Resource Metadata (RFC 9728)
  * /.well-known/oauth-protected-resource
+ *
+ * Delegates OAuth to Google's authorization server for TextQL compatibility
  */
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
   res.json({
     resource: serverUrl,
-    authorization_servers: [serverUrl],
+    authorization_servers: ["https://accounts.google.com"],
     bearer_methods_supported: ["header"],
     scopes_supported: SCOPES,
     mcp_version: "2024-11-05",
