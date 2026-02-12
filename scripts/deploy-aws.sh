@@ -69,8 +69,8 @@ ecr_login() {
 
 # Build Docker image
 build_image() {
-    log_info "Building Docker image..."
-    docker build -t "$ECR_REPOSITORY" .
+    log_info "Building Docker image for linux/amd64 platform..."
+    docker build --platform linux/amd64 -t "$ECR_REPOSITORY" .
     log_info "Docker build successful ✓"
 }
 
