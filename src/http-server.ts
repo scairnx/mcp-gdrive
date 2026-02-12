@@ -7,6 +7,7 @@ import cors from "cors";
 import { registerHandlers } from "./handlers.js";
 import type { OAuth2Client } from "google-auth-library";
 import { loadUserCredentials, createGoogleAuth, listAvailableUsers } from "./auth.js";
+import { setupOAuthRoutes } from "./oauth.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -105,6 +106,9 @@ async function createApp(): Promise<express.Application> {
     console.error(`${new Date().toISOString()} ${req.method} ${req.path}`);
     next();
   });
+
+  // OAuth discovery endpoints (for client compatibility)
+  setupOAuthRoutes(app);
 
   // Health check endpoint
   app.get("/health", (req: Request, res: Response) => {
