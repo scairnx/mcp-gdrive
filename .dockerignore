@@ -1,0 +1,60 @@
+# Dependencies
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Build outputs
+dist
+*.tsbuildinfo
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Environment and credentials (SECURITY)
+.env
+.env.*
+gcp-oauth.keys.json
+.gdrive-server-credentials.json
+*.credentials.json
+*.keys.json
+
+# Testing
+coverage
+.nyc_output
+*.test.ts
+*.spec.ts
+__tests__
+test
+
+# Documentation
+*.md
+!README.md
+docs
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+.circleci
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log
+temp
+tmp
+.temp
+.tmp
+.cache
+
+# Claude and plans
+.claude
