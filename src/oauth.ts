@@ -21,18 +21,36 @@ const userTokens = new Map<string, { access_token: string; refresh_token?: strin
 
 /**
  * Get the server's public URL
+ * Properly detects HTTPS when behind CloudFront/ALB
  */
 function getServerUrl(req: Request): string {
+  const host = req.get('host') || req.hostname;
+
+  // Check various headers that indicate the original protocol
   const forwardedProto = req.headers['x-forwarded-proto'] as string;
+  const cloudFrontProto = req.headers['cloudfront-forwarded-proto'] as string;
   const forwardedHost = req.headers['x-forwarded-host'] as string;
 
-  if (forwardedProto && forwardedHost) {
-    return `${forwardedProto}://${forwardedHost}`;
+  // Determine protocol
+  let protocol = 'http';
+
+  // If host is cloudfront.net, always use HTTPS
+  if (host && host.includes('cloudfront.net')) {
+    protocol = 'https';
+  }
+  // Check forwarded protocol headers
+  else if (forwardedProto) {
+    protocol = forwardedProto.split(',')[0].trim();
+  } else if (cloudFrontProto) {
+    protocol = cloudFrontProto;
+  } else if (req.secure || req.protocol === 'https') {
+    protocol = 'https';
   }
 
-  const protocol = req.protocol;
-  const host = req.get('host');
-  return `${protocol}://${host}`;
+  // Use forwarded host if available, otherwise use request host
+  const finalHost = forwardedHost || host;
+
+  return `${protocol}://${finalHost}`;
 }
 
 /**
