@@ -6,10 +6,6 @@ import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import { registerHandlers } from "./handlers.js";
 import type { OAuth2Client } from "google-auth-library";
-import {
-  getProtectedResourceMetadata,
-  oauthMiddleware,
-} from "./oauth.js";
 import { loadUserCredentials, createGoogleAuth, listAvailableUsers } from "./auth.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -18,6 +14,9 @@ const DEFAULT_USER = process.env.DEFAULT_USER || "scott";
 
 // Cache for auth clients (user ID -> OAuth2Client)
 const authCache = new Map<string, any>();
+
+// Session management for SSE transports
+const transports: { [sessionId: string]: SSEServerTransport } = {};
 
 /**
  * Get or create OAuth2Client for a specific user
@@ -107,9 +106,6 @@ async function createApp(): Promise<express.Application> {
     next();
   });
 
-  // OAuth middleware - validates Bearer tokens
-  app.use(oauthMiddleware);
-
   // Health check endpoint
   app.get("/health", (req: Request, res: Response) => {
     res.json({
@@ -150,13 +146,18 @@ async function createApp(): Promise<express.Application> {
       const server = createMcpServer(userId);
       const transport = new SSEServerTransport("/message", res);
 
-      await server.connect(transport);
+      // Track session for message handling
+      transports[transport.sessionId] = transport;
+      console.error(`Session created: ${transport.sessionId}`);
 
       // Handle client disconnect
-      req.on("close", () => {
-        console.error(`SSE connection closed for user: ${userId}`);
+      res.on("close", () => {
+        console.error(`SSE connection closed for user: ${userId}, session: ${transport.sessionId}`);
+        delete transports[transport.sessionId];
         server.close();
       });
+
+      await server.connect(transport);
     } catch (error: any) {
       console.error(`Failed to establish SSE connection for user ${userId}:`, error);
       res.status(400).json({
@@ -169,10 +170,34 @@ async function createApp(): Promise<express.Application> {
 
   // MCP message endpoint (POST for client messages)
   app.post("/message", async (req: Request, res: Response) => {
-    // This endpoint receives messages from the client
-    // The SSEServerTransport handles routing these to the server
-    console.error("Received message from client");
-    res.status(202).json({ received: true });
+    const sessionId = req.query.sessionId as string;
+
+    if (!sessionId) {
+      return res.status(400).json({
+        error: "Missing sessionId query parameter"
+      });
+    }
+
+    const transport = transports[sessionId];
+
+    if (!transport) {
+      console.error(`Session not found: ${sessionId}`);
+      return res.status(404).json({
+        error: "Session not found",
+        message: "Invalid or expired sessionId"
+      });
+    }
+
+    try {
+      // Handle the message through the transport
+      await transport.handlePostMessage(req, res);
+    } catch (error: any) {
+      console.error(`Error handling message for session ${sessionId}:`, error);
+      res.status(500).json({
+        error: "Message handling failed",
+        message: error.message
+      });
+    }
   });
 
   // 404 handler

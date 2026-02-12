@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+## ⚡ Recent Updates (Feb 12, 2026)
+
+**FIXED: MCP server now works with ALL clients!**
+
+Critical bugs fixed:
+- ✅ SSE transport session management implemented correctly
+- ✅ `.mcp.json` configured for Claude Desktop
+- ✅ Removed dead OAuth code (102 lines)
+- ✅ Message handling via `transport.handlePostMessage()` working
+
+See `FIXES_APPLIED.md` and `TESTING_GUIDE.md` for details.
+
+---
+
 ## Project Overview
 
 This is an MCP (Model Context Protocol) server for Google Drive integration. It enables Claude and other MCP clients to interact with Google Drive through a standardized interface, providing file search, listing, and read capabilities.

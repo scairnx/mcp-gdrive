@@ -7,6 +7,13 @@ dist/
 # Credentials (NEVER commit these)
 gcp-oauth.keys.json
 .gdrive-server-credentials.json
+credentials/
+
+# MCP Configuration (contains access tokens)
+.mcp.json
+
+# Claude Code local settings
+.claude/
 
 # Environment variables
 .env
