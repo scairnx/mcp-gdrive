@@ -1,64 +1,25 @@
 #!/usr/bin/env node
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
+import { randomUUID } from "crypto";
 import { registerHandlers } from "./handlers.js";
-import { setupOAuthRoutes, oauthMiddleware, getAuthFromRequest } from "./oauth.js";
-import { loadUserCredentials, createGoogleAuth } from "./auth.js";
-import { google } from "googleapis";
+import { setupOAuthRoutes, oauthMiddleware } from "./oauth.js";
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-// Session management for SSE transports
-const transports: { [sessionId: string]: SSEServerTransport } = {};
-
-// Pre-authenticated credentials (shared across sessions when not using OAuth)
-let preAuthClient: InstanceType<typeof google.auth.OAuth2> | null = null;
-let preAuthUserId: string | null = null;
+// Single MCP server instance
+let mcpServer: Server;
+let transport: StreamableHTTPServerTransport;
 
 /**
- * Load pre-authenticated credentials if available
+ * Create and configure the MCP server with OAuth authentication
  */
-async function loadPreAuthCredentials(): Promise<void> {
-  try {
-    // Try to load from environment variable first (AWS Secrets Manager)
-    if (process.env.GDRIVE_CREDENTIALS) {
-      console.error("Loading pre-authenticated credentials from environment variable");
-      const credentials = JSON.parse(process.env.GDRIVE_CREDENTIALS);
-      preAuthClient = createGoogleAuth(credentials);
-      preAuthUserId = "service-account";
-      console.error("✓ Pre-authenticated credentials loaded from environment");
-      return;
-    }
-
-    // Try to load from user credentials file
-    const userId = process.env.GDRIVE_USER || "default";
-    console.error(`Attempting to load pre-authenticated credentials for user: ${userId}`);
-    const credentials = await loadUserCredentials(userId);
-    preAuthClient = createGoogleAuth(credentials);
-    preAuthUserId = userId;
-    console.error(`✓ Pre-authenticated credentials loaded for user: ${userId}`);
-  } catch (error: any) {
-    console.error("⚠️  No pre-authenticated credentials available");
-    console.error("   To use pre-authenticated mode, either:");
-    console.error("   1. Run: node dist/index.js auth-user <userId>");
-    console.error("   2. Set GDRIVE_USER environment variable");
-    console.error("   3. Set GDRIVE_CREDENTIALS environment variable");
-    console.error("");
-    console.error("   OAuth mode is still available at /oauth/authorize");
-    preAuthClient = null;
-    preAuthUserId = null;
-  }
-}
-
-/**
- * Create and configure the MCP server with hybrid authentication
- * Supports both OAuth Bearer tokens and pre-authenticated credentials
- */
-function createMcpServer(req: Request): Server {
+function createMcpServer(): Server {
   const server = new Server(
     {
       name: "mcp-gdrive-server",
@@ -72,44 +33,43 @@ function createMcpServer(req: Request): Server {
     },
   );
 
-  // Register handlers with hybrid auth provider
-  registerHandlers(server, () => {
-    // Check if request has OAuth authentication
+  // Register handlers with OAuth auth provider
+  registerHandlers(server, (req?: Request) => {
+    if (!req) {
+      throw new Error("Request object required for authentication");
+    }
+
+    // Get OAuth authenticated client from request
     const authClient = (req as any).authClient;
-    if (authClient) {
-      console.error(`Using OAuth authentication for user: ${(req as any).userId}`);
-      return authClient;
+    if (!authClient) {
+      throw new Error(
+        "No OAuth authentication found. Provide Bearer token in Authorization header."
+      );
     }
 
-    // Fall back to pre-authenticated credentials
-    if (preAuthClient) {
-      console.error(`Using pre-authenticated credentials for user: ${preAuthUserId}`);
-      return preAuthClient;
-    }
-
-    throw new Error(
-      "No authentication available. Either provide Bearer token or configure pre-authenticated credentials."
-    );
+    console.error(`Using OAuth authentication for user: ${(req as any).userId}`);
+    return authClient;
   });
 
   return server;
 }
 
 /**
- * Create Express app with SSE transport
+ * Create Express app with Streamable HTTP transport
  */
 async function createApp(): Promise<express.Application> {
-  const app = express();
-
-  // Middleware
-  app.use(express.json());
+  // Create Express app without DNS rebinding protection (not needed for 0.0.0.0 binding)
+  // DNS rebinding protection is only needed when binding to localhost
+  const app = createMcpExpressApp({
+    host: "0.0.0.0" // Bind to all interfaces for cloud deployment
+  });
 
   // Enable CORS for all origins (required for browser-based MCP clients)
   app.use(cors({
     origin: "*",
-    methods: ["GET", "POST", "OPTIONS", "HEAD"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-GDrive-User"],
-    exposedHeaders: ["WWW-Authenticate"],
+    methods: ["GET", "POST", "OPTIONS", "HEAD", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization", "MCP-Session-Id", "MCP-Protocol-Version", "Last-Event-ID"],
+    exposedHeaders: ["WWW-Authenticate", "Link", "MCP-Session-Id", "MCP-Protocol-Version"],
     credentials: false,
     maxAge: 86400 // 24 hours
   }));
@@ -123,114 +83,76 @@ async function createApp(): Promise<express.Application> {
   // OAuth discovery and authorization endpoints
   setupOAuthRoutes(app);
 
-  // OAuth middleware - validates Bearer tokens for protected endpoints
-  app.use(oauthMiddleware);
-
   // Health check endpoint (public)
   app.get("/health", (req: Request, res: Response) => {
-    const authMethods = [];
-    if (preAuthClient) {
-      authMethods.push("pre-authenticated");
-    }
-    authMethods.push("oauth2");
-
     res.json({
       status: "healthy",
       service: "mcp-gdrive-server",
       version: "0.6.2",
       authentication: {
-        methods: authMethods,
-        pre_auth_available: !!preAuthClient,
-        pre_auth_user: preAuthUserId || null,
-        oauth_available: true
+        method: "oauth2",
+        required: true
       },
       oauth_endpoints: {
         authorize: "/oauth/authorize",
         token: "/oauth/token",
         metadata: "/.well-known/oauth-protected-resource"
       },
+      mcp_endpoint: "/mcp",
+      protocol_version: "2025-11-25",
+      transport: "streamable-http",
       timestamp: new Date().toISOString(),
     });
   });
 
-  // MCP endpoint with SSE transport (OAuth-protected)
-  app.get("/sse", async (req: Request, res: Response) => {
-    const userId = (req as any).userId || "authenticated-user";
-    console.error(`New SSE connection established for user: ${userId}`);
-
+  // MCP endpoint handler function
+  const mcpHandler = async (req: Request, res: Response) => {
     try {
-      const server = createMcpServer(req);
-      const transport = new SSEServerTransport("/message", res);
+      // Store request object in transport context for auth provider
+      (transport as any)._currentRequest = req;
 
-      // Track session for message handling
-      transports[transport.sessionId] = transport;
-      console.error(`Session created: ${transport.sessionId}`);
-
-      // Handle client disconnect
-      res.on("close", () => {
-        console.error(`SSE connection closed for user: ${userId}, session: ${transport.sessionId}`);
-        delete transports[transport.sessionId];
-        server.close();
-      });
-
-      await server.connect(transport);
+      // Handle the request using Streamable HTTP transport
+      await transport.handleRequest(req as any, res as any, req.body);
     } catch (error: any) {
-      console.error(`Failed to establish SSE connection for user ${userId}:`, error);
-      res.status(500).json({
-        error: "Connection failed",
-        message: error.message
-      });
+      console.error(`MCP endpoint error:`, error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Internal Server Error",
+          message: NODE_ENV === "development" ? error.message : "An error occurred",
+        });
+      }
+    } finally {
+      // Clean up request context
+      delete (transport as any)._currentRequest;
     }
-  });
+  };
 
-  // MCP message endpoint (POST for client messages)
-  app.post("/message", async (req: Request, res: Response) => {
-    const sessionId = req.query.sessionId as string;
+  // MCP endpoint with OAuth authentication middleware
+  // Mount on both /mcp and root / so clients can use either URL
+  app.use("/mcp", oauthMiddleware);
+  app.all("/mcp", mcpHandler);
 
-    if (!sessionId) {
-      return res.status(400).json({
-        error: "Missing sessionId query parameter"
-      });
-    }
-
-    const transport = transports[sessionId];
-
-    if (!transport) {
-      console.error(`Session not found: ${sessionId}`);
-      return res.status(404).json({
-        error: "Session not found",
-        message: "Invalid or expired sessionId"
-      });
-    }
-
-    try {
-      // Handle the message through the transport
-      await transport.handlePostMessage(req, res);
-    } catch (error: any) {
-      console.error(`Error handling message for session ${sessionId}:`, error);
-      res.status(500).json({
-        error: "Message handling failed",
-        message: error.message
-      });
-    }
-  });
+  // Also mount on root path for clients that use the root URL (e.g., TextQL)
+  app.all("/", oauthMiddleware, mcpHandler);
 
   // 404 handler
   app.use((req: Request, res: Response) => {
     res.status(404).json({
       error: "Not Found",
       message: `Route ${req.method} ${req.path} not found`,
-      hint: "Available endpoints: /health, /oauth/authorize, /sse",
+      hint: "Available endpoints: /health, /oauth/authorize, /mcp",
     });
   });
 
   // Error handler
   app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
     console.error("Error:", err);
-    res.status(500).json({
-      error: "Internal Server Error",
-      message: NODE_ENV === "development" ? err.message : "An error occurred",
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "Internal Server Error",
+        message: NODE_ENV === "development" ? err.message : "An error occurred",
+      });
+    }
   });
 
   return app;
@@ -241,12 +163,30 @@ async function createApp(): Promise<express.Application> {
  */
 async function main() {
   try {
-    console.error("Starting MCP Google Drive HTTP Server with Hybrid Authentication...");
+    console.error("Starting MCP Google Drive HTTP Server with OAuth 2.0 Authentication...");
     console.error(`Environment: ${NODE_ENV}`);
+    console.error(`Protocol Version: 2025-11-25 (Streamable HTTP)`);
     console.error("");
 
-    // Load pre-authenticated credentials if available
-    await loadPreAuthCredentials();
+    // Create MCP server
+    mcpServer = createMcpServer();
+
+    // Create Streamable HTTP transport with stateful sessions
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+    });
+
+    // Enhance auth provider to get request from transport context
+    const originalAuthProvider = (mcpServer as any)._authProvider;
+    (mcpServer as any)._authProvider = () => {
+      const req = (transport as any)._currentRequest;
+      return originalAuthProvider(req);
+    };
+
+    // Connect server to transport
+    await mcpServer.connect(transport);
+
+    console.error("✓ MCP Server connected to Streamable HTTP transport");
     console.error("");
 
     // Create and start Express app
@@ -255,41 +195,31 @@ async function main() {
       console.error(`\nServer listening on port ${PORT}`);
       console.error(`\nEndpoints:`);
       console.error(`  Health: http://localhost:${PORT}/health`);
-      console.error(`  MCP SSE: http://localhost:${PORT}/sse`);
+      console.error(`  MCP: http://localhost:${PORT}/mcp`);
       console.error(`  OAuth Authorize: http://localhost:${PORT}/oauth/authorize`);
       console.error(`  OAuth Metadata: http://localhost:${PORT}/.well-known/oauth-protected-resource`);
-      console.error(`\nAuthentication Methods:`);
-
-      if (preAuthClient) {
-        console.error(`  ✓ Pre-authenticated: User '${preAuthUserId}'`);
-        console.error(`    - MCP clients can connect without Bearer token`);
-      } else {
-        console.error(`  ✗ Pre-authenticated: Not configured`);
-        console.error(`    - To enable: Run 'node dist/index.js auth-user <userId>'`);
-      }
-
-      console.error(`  ✓ OAuth 2.0: Available`);
-      console.error(`    - Visit http://localhost:${PORT}/oauth/authorize`);
-      console.error(`    - Copy access token and use: Authorization: Bearer <token>`);
+      console.error(`\nAuthentication:`);
+      console.error(`  OAuth 2.0 (Required)`);
+      console.error(`    1. Visit http://localhost:${PORT}/oauth/authorize to authenticate`);
+      console.error(`    2. Copy the access token from the success page`);
+      console.error(`    3. MCP clients will use OAuth 2.0 flow automatically`);
       console.error(``);
     });
 
     // Graceful shutdown
-    process.on("SIGTERM", () => {
-      console.error("SIGTERM received, shutting down gracefully...");
+    const shutdown = async () => {
+      console.error("Shutting down gracefully...");
       server.close(() => {
-        console.error("Server closed");
-        process.exit(0);
+        console.error("HTTP server closed");
       });
-    });
+      await mcpServer.close();
+      await transport.close();
+      console.error("MCP server and transport closed");
+      process.exit(0);
+    };
 
-    process.on("SIGINT", () => {
-      console.error("SIGINT received, shutting down gracefully...");
-      server.close(() => {
-        console.error("Server closed");
-        process.exit(0);
-      });
-    });
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
 
   } catch (error) {
     console.error("Failed to start server:", error);

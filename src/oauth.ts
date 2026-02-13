@@ -16,7 +16,16 @@ const SCOPES = [
 
 // In-memory storage for OAuth state and tokens
 // In production, use Redis or a database
-const oauthStates = new Map<string, { timestamp: number; clientId?: string }>();
+const oauthStates = new Map<string, {
+  timestamp: number;
+  clientId?: string;
+  clientRedirectUri?: string;
+  clientState?: string;
+}>();
+const authorizationCodes = new Map<string, {
+  timestamp: number;
+  tokens: { access_token: string; refresh_token?: string; expiry_date?: number };
+}>();
 const userTokens = new Map<string, { access_token: string; refresh_token?: string; expiry_date?: number }>();
 
 /**
@@ -77,36 +86,41 @@ async function createOAuthClient(req: Request): Promise<OAuth2Client> {
  * OAuth Protected Resource Metadata (RFC 9728)
  * /.well-known/oauth-protected-resource
  *
- * Delegates OAuth to Google's authorization server for TextQL compatibility
+ * Points to our own server which proxies Google OAuth metadata
+ * This allows TextQL to discover OAuth 2.1 metadata even though
+ * Google only exposes OpenID Connect metadata
  */
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
   res.json({
     resource: serverUrl,
-    authorization_servers: ["https://accounts.google.com"],
+    authorization_servers: [serverUrl],
     bearer_methods_supported: ["header"],
-    scopes_supported: SCOPES,
-    mcp_version: "2024-11-05",
-    authentication_required: true
+    scopes_supported: SCOPES
   });
 }
 
 /**
  * OAuth Authorization Server Metadata (RFC 8414)
  * /.well-known/oauth-authorization-server
+ *
+ * Acts as OAuth authorization server proxy for Google Drive.
+ * MCP clients (like TextQL) can complete the full OAuth dance through our server.
  */
-export function handleAuthServerMetadata(req: Request, res: Response): void {
+export async function handleAuthServerMetadata(req: Request, res: Response): Promise<void> {
   const serverUrl = getServerUrl(req);
 
+  // Point to OUR endpoints - we proxy the OAuth flow to Google
   res.json({
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
     token_endpoint: `${serverUrl}/oauth/token`,
-    scopes_supported: SCOPES,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post"]
+    token_endpoint_auth_methods_supported: ["none"], // No client authentication required
+    code_challenge_methods_supported: ["S256", "plain"],
+    scopes_supported: SCOPES
   });
 }
 
@@ -114,17 +128,33 @@ export function handleAuthServerMetadata(req: Request, res: Response): void {
  * OAuth Authorization Endpoint
  * GET /oauth/authorize
  *
+ * Accepts authorization request from MCP client (e.g., TextQL)
  * Redirects user to Google's OAuth consent screen
+ * Stores client's redirect_uri to send them the authorization code later
  */
 export async function handleAuthorize(req: Request, res: Response): Promise<any> {
   try {
+    const clientRedirectUri = req.query.redirect_uri as string;
+    const clientState = req.query.state as string;
+    const responseType = req.query.response_type as string;
+
+    // Validate required OAuth parameters
+    if (responseType && responseType !== "code") {
+      return res.status(400).json({
+        error: "unsupported_response_type",
+        error_description: "Only 'code' response type is supported"
+      });
+    }
+
     const oauth2Client = await createOAuthClient(req);
 
     // Generate state for CSRF protection
     const state = crypto.randomBytes(32).toString("hex");
     oauthStates.set(state, {
       timestamp: Date.now(),
-      clientId: req.query.client_id as string
+      clientId: req.query.client_id as string,
+      clientRedirectUri: clientRedirectUri, // Store where to redirect back
+      clientState: clientState // Store client's state to return it
     });
 
     // Clean up old states (older than 10 minutes)
@@ -135,7 +165,7 @@ export async function handleAuthorize(req: Request, res: Response): Promise<any>
       }
     }
 
-    // Generate authorization URL
+    // Generate authorization URL to redirect to Google
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: "offline",
       scope: SCOPES,
@@ -143,6 +173,7 @@ export async function handleAuthorize(req: Request, res: Response): Promise<any>
       prompt: "consent" // Force consent screen to get refresh token
     });
 
+    console.error(`OAuth authorize: redirecting to Google (client redirect: ${clientRedirectUri})`);
     res.redirect(authUrl);
   } catch (error: any) {
     console.error("Authorization error:", error);
@@ -158,6 +189,8 @@ export async function handleAuthorize(req: Request, res: Response): Promise<any>
  * GET /oauth/callback
  *
  * Receives authorization code from Google and exchanges for tokens
+ * If this was initiated by an MCP client (TextQL), redirects back with our own code
+ * Otherwise, displays the access token for manual use
  */
 export async function handleCallback(req: Request, res: Response): Promise<any> {
   try {
@@ -188,23 +221,56 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
       `);
     }
 
-    // Exchange code for tokens
+    // Get stored OAuth state
+    const oauthState = oauthStates.get(state as string)!;
+    const clientRedirectUri = oauthState.clientRedirectUri;
+    const clientState = oauthState.clientState;
+
+    // Exchange code for tokens with Google
     const oauth2Client = await createOAuthClient(req);
     const { tokens } = await oauth2Client.getToken(code as string);
 
-    // Store tokens (in production, associate with user session)
-    const tokenId = crypto.randomBytes(16).toString("hex");
-    userTokens.set(tokenId, {
-      access_token: tokens.access_token!,
-      refresh_token: tokens.refresh_token || undefined,
-      expiry_date: tokens.expiry_date || undefined
-    });
+    console.error(`OAuth callback: Got tokens from Google. Client redirect: ${clientRedirectUri}`);
 
     // Clean up state
     oauthStates.delete(state as string);
 
-    // Return success page with token
-    res.send(`
+    // If this was initiated by an MCP client (has redirect_uri), complete the OAuth flow
+    if (clientRedirectUri) {
+      // Generate authorization code for the client
+      const authCode = crypto.randomBytes(32).toString("hex");
+
+      // Store the tokens with the auth code (valid for 10 minutes)
+      authorizationCodes.set(authCode, {
+        timestamp: Date.now(),
+        tokens: {
+          access_token: tokens.access_token!,
+          refresh_token: tokens.refresh_token || undefined,
+          expiry_date: tokens.expiry_date || undefined
+        }
+      });
+
+      // Clean up old authorization codes
+      const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+      for (const [key, value] of authorizationCodes.entries()) {
+        if (value.timestamp < tenMinutesAgo) {
+          authorizationCodes.delete(key);
+        }
+      }
+
+      // Redirect back to client with authorization code
+      const redirectUrl = new URL(clientRedirectUri);
+      redirectUrl.searchParams.set("code", authCode);
+      if (clientState) {
+        redirectUrl.searchParams.set("state", clientState);
+      }
+
+      console.error(`OAuth callback: Redirecting to client: ${redirectUrl.toString()}`);
+      return res.redirect(redirectUrl.toString());
+    }
+
+    // Manual OAuth flow - display token to user
+    return res.send(`
       <html>
         <head>
           <style>
@@ -227,7 +293,7 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
             <li>Configure your MCP client with:<br/>
               <code>Authorization: Bearer ${tokens.access_token}</code>
             </li>
-            <li>Connect to the MCP endpoint: <code>${getServerUrl(req)}/sse</code></li>
+            <li>Connect to the MCP endpoint: <code>${getServerUrl(req)}/mcp</code></li>
           </ol>
 
           <p><strong>Note:</strong> This token will expire. Use the refresh token to get a new one.</p>
@@ -256,6 +322,7 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
  * POST /oauth/token
  *
  * Exchanges authorization code or refresh token for access token
+ * Accepts OUR authorization codes from the callback redirect
  */
 export async function handleToken(req: Request, res: Response): Promise<any> {
   try {
@@ -268,8 +335,6 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
       });
     }
 
-    const oauth2Client = await createOAuthClient(req);
-
     if (grant_type === "authorization_code") {
       if (!code) {
         return res.status(400).json({
@@ -278,12 +343,30 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
         });
       }
 
-      const { tokens } = await oauth2Client.getToken(code);
+      // Look up our authorization code
+      const authData = authorizationCodes.get(code);
+      if (!authData) {
+        console.error(`Token exchange failed: Invalid authorization code`);
+        return res.status(400).json({
+          error: "invalid_grant",
+          error_description: "Authorization code is invalid or expired"
+        });
+      }
+
+      // Delete the authorization code (one-time use)
+      authorizationCodes.delete(code);
+
+      const tokens = authData.tokens;
+      const expiresIn = tokens.expiry_date
+        ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
+        : 3600;
+
+      console.error(`Token exchange successful: Returning Google tokens to client`);
 
       return res.json({
         access_token: tokens.access_token,
         token_type: "Bearer",
-        expires_in: tokens.expiry_date ? Math.floor((tokens.expiry_date - Date.now()) / 1000) : 3600,
+        expires_in: expiresIn > 0 ? expiresIn : 3600,
         refresh_token: tokens.refresh_token,
         scope: SCOPES.join(" ")
       });
@@ -295,6 +378,7 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
         });
       }
 
+      const oauth2Client = await createOAuthClient(req);
       oauth2Client.setCredentials({ refresh_token });
       const { credentials } = await oauth2Client.refreshAccessToken();
 
@@ -320,11 +404,11 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
 }
 
 /**
- * OAuth Middleware - Validates Bearer tokens (OPTIONAL)
+ * OAuth Middleware - Validates Bearer tokens (REQUIRED)
  *
  * Extracts and validates Bearer token from Authorization header
  * Attaches OAuth2Client to request for downstream handlers
- * If no token present, allows request to continue (hybrid auth mode)
+ * Returns 401 with WWW-Authenticate header if no token present
  */
 export async function oauthMiddleware(
   req: Request,
@@ -348,14 +432,27 @@ export async function oauthMiddleware(
   // Extract Bearer token
   const authHeader = req.headers.authorization;
 
-  // If no authorization header, allow request to continue (will use pre-auth credentials)
+  // If no authorization header, return 401 to trigger OAuth discovery
   if (!authHeader) {
-    console.error("No Authorization header - will use pre-authenticated credentials if available");
-    return next();
+    console.error("No Authorization header - returning 401 to trigger OAuth discovery");
+    const serverUrl = getServerUrl(req);
+    const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
+    return res.status(401).json({
+      error: "invalid_token",
+      error_description: "Bearer token required. Visit /oauth/authorize to authenticate."
+    });
   }
 
   const parts = authHeader.split(" ");
   if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
+    const serverUrl = getServerUrl(req);
+    const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
     return res.status(401).json({
       error: "invalid_token",
       error_description: "Invalid Authorization header format. Use: Bearer <token>"
@@ -393,6 +490,11 @@ export async function oauthMiddleware(
     next();
   } catch (error: any) {
     console.error("Token validation error:", error);
+    const serverUrl = getServerUrl(req);
+    const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
     return res.status(401).json({
       error: "invalid_token",
       error_description: "Token validation failed: " + error.message
