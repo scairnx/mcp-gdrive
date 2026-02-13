@@ -94,13 +94,27 @@ async function createOAuthClient(req: Request): Promise<OAuth2Client> {
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
-  // RFC 9728: authorization_servers must be full URLs to authorization server metadata
-  // Point to /.well-known/oauth-authorization-server per RFC 8414
+  // RFC 9728 OAuth Protected Resource Metadata
+  // IMPORTANT: Some MCP clients (like TextQL) expect authorization server metadata
+  // to be inlined here rather than following authorization_servers links.
+  // We include BOTH the RFC 9728 fields AND inline authorization server metadata.
   res.json({
+    // RFC 9728 required fields
     resource: serverUrl,
     authorization_servers: [`${serverUrl}/.well-known/oauth-authorization-server`],
     bearer_methods_supported: ["header"],
-    scopes_supported: SCOPES
+    scopes_supported: SCOPES,
+
+    // Inline authorization server metadata (for clients that expect it here)
+    // This matches RFC 8414 authorization server metadata format
+    issuer: serverUrl,
+    authorization_endpoint: `${serverUrl}/oauth/authorize`,
+    token_endpoint: `${serverUrl}/oauth/token`,
+    registration_endpoint: `${serverUrl}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256", "plain"]
   });
 }
 
