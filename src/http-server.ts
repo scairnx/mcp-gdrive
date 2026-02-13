@@ -82,7 +82,7 @@ async function createApp(): Promise<express.Application> {
     next();
   });
 
-  // OAuth discovery and authorization endpoints
+  // OAuth discovery and authorization endpoints (manual body parsing in handlers)
   setupOAuthRoutes(app);
 
   // Health check endpoint (public)

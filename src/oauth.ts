@@ -340,7 +340,31 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
  */
 export async function handleToken(req: Request, res: Response): Promise<any> {
   try {
-    const { grant_type, code, refresh_token } = req.body;
+    // Manually parse body if not already parsed (workaround for MCP SDK app issues)
+    let body = req.body;
+    if (!body || Object.keys(body).length === 0) {
+      body = await new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', chunk => data += chunk);
+        req.on('end', () => {
+          try {
+            // Try JSON first
+            if (req.headers['content-type']?.includes('application/json')) {
+              resolve(JSON.parse(data));
+            } else {
+              // Try URL-encoded
+              const params = new URLSearchParams(data);
+              resolve(Object.fromEntries(params.entries()));
+            }
+          } catch (e) {
+            reject(new Error('Failed to parse request body'));
+          }
+        });
+        req.on('error', reject);
+      });
+    }
+
+    const { grant_type, code, refresh_token } = body;
 
     if (!grant_type) {
       return res.status(400).json({
@@ -426,7 +450,31 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
  */
 export async function handleRegister(req: Request, res: Response): Promise<any> {
   try {
-    const { redirect_uris, client_name, ...rest } = req.body || {};
+    // Manually parse body if not already parsed (workaround for MCP SDK app issues)
+    let body = req.body;
+    if (!body || Object.keys(body).length === 0) {
+      body = await new Promise((resolve, reject) => {
+        let data = '';
+        req.on('data', chunk => data += chunk);
+        req.on('end', () => {
+          try {
+            // Try JSON first
+            if (req.headers['content-type']?.includes('application/json')) {
+              resolve(JSON.parse(data));
+            } else {
+              // Try URL-encoded
+              const params = new URLSearchParams(data);
+              resolve(Object.fromEntries(params.entries()));
+            }
+          } catch (e) {
+            reject(new Error('Failed to parse request body'));
+          }
+        });
+        req.on('error', reject);
+      });
+    }
+
+    const { redirect_uris, client_name, ...rest } = body || {};
 
     const clientId = crypto.randomUUID();
 
@@ -585,9 +633,9 @@ export function setupOAuthRoutes(app: any): void {
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
   app.get("/.well-known/openid-configuration", handleAuthServerMetadata); // OIDC fallback
 
-  // OAuth flow endpoints
+  // OAuth flow endpoints (handlers parse body manually due to MCP SDK app conflicts)
   app.get("/oauth/authorize", handleAuthorize);
   app.get("/oauth/callback", handleCallback);
   app.post("/oauth/token", handleToken);
-  app.post("/oauth/register", handleRegister); // Dynamic client registration (RFC 7591)
+  app.post("/oauth/register", handleRegister);
 }
