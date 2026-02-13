@@ -624,6 +624,8 @@ export function getAuthFromRequest(req: Request): OAuth2Client {
 export function setupOAuthRoutes(app: any): void {
   // OAuth discovery endpoints
   app.get("/.well-known/oauth-protected-resource", handleOAuthMetadata);
+  // Path-specific metadata for mcp-go SDK resource ID-based discovery (RFC 9728)
+  app.get("/.well-known/oauth-protected-resource/mcp", handleOAuthMetadata);
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
   app.get("/.well-known/openid-configuration", handleAuthServerMetadata); // OIDC fallback
 
