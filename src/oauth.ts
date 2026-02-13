@@ -27,6 +27,7 @@ const authorizationCodes = new Map<string, {
   tokens: { access_token: string; refresh_token?: string; expiry_date?: number };
 }>();
 const userTokens = new Map<string, { access_token: string; refresh_token?: string; expiry_date?: number }>();
+const registeredClients = new Map<string, { client_id: string; redirect_uris?: string[]; client_name?: string; timestamp: number }>();
 
 /**
  * Get the server's public URL
@@ -93,11 +94,23 @@ async function createOAuthClient(req: Request): Promise<OAuth2Client> {
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
+  // Include both RFC 9728 standard fields AND authorization server metadata inline.
+  // Some MCP clients (like TextQL) may look for auth server details directly
+  // in the protected resource metadata instead of doing a two-step discovery.
   res.json({
     resource: serverUrl,
     authorization_servers: [serverUrl],
     bearer_methods_supported: ["header"],
-    scopes_supported: SCOPES
+    scopes_supported: SCOPES,
+    // Inline authorization server metadata for clients that expect it here
+    issuer: serverUrl,
+    authorization_endpoint: `${serverUrl}/oauth/authorize`,
+    token_endpoint: `${serverUrl}/oauth/token`,
+    registration_endpoint: `${serverUrl}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256", "plain"]
   });
 }
 
@@ -116,9 +129,10 @@ export async function handleAuthServerMetadata(req: Request, res: Response): Pro
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
     token_endpoint: `${serverUrl}/oauth/token`,
+    registration_endpoint: `${serverUrl}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-    token_endpoint_auth_methods_supported: ["none"], // No client authentication required
+    token_endpoint_auth_methods_supported: ["none"],
     code_challenge_methods_supported: ["S256", "plain"],
     scopes_supported: SCOPES
   });
@@ -404,6 +418,53 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
 }
 
 /**
+ * OAuth Dynamic Client Registration (RFC 7591)
+ * POST /oauth/register
+ *
+ * MCP clients register themselves to get a client_id.
+ * Since we proxy to Google OAuth, we just generate a client_id for tracking.
+ */
+export async function handleRegister(req: Request, res: Response): Promise<any> {
+  try {
+    const { redirect_uris, client_name, ...rest } = req.body || {};
+
+    const clientId = crypto.randomUUID();
+
+    registeredClients.set(clientId, {
+      client_id: clientId,
+      redirect_uris,
+      client_name,
+      timestamp: Date.now()
+    });
+
+    // Clean up old registrations (older than 24 hours)
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [key, value] of registeredClients.entries()) {
+      if (value.timestamp < oneDayAgo) {
+        registeredClients.delete(key);
+      }
+    }
+
+    console.error(`OAuth client registered: ${clientId} (${client_name || 'unnamed'})`);
+
+    return res.status(201).json({
+      client_id: clientId,
+      client_name: client_name,
+      redirect_uris: redirect_uris,
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none"
+    });
+  } catch (error: any) {
+    console.error("Registration error:", error);
+    res.status(400).json({
+      error: "invalid_client_metadata",
+      error_description: error.message
+    });
+  }
+}
+
+/**
  * OAuth Middleware - Validates Bearer tokens (REQUIRED)
  *
  * Extracts and validates Bearer token from Authorization header
@@ -421,8 +482,10 @@ export async function oauthMiddleware(
     "/oauth/authorize",
     "/oauth/callback",
     "/oauth/token",
+    "/oauth/register",
     "/.well-known/oauth-protected-resource",
-    "/.well-known/oauth-authorization-server"
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration"
   ];
 
   if (publicPaths.some(path => req.path === path)) {
@@ -520,9 +583,11 @@ export function setupOAuthRoutes(app: any): void {
   // OAuth discovery endpoints
   app.get("/.well-known/oauth-protected-resource", handleOAuthMetadata);
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
+  app.get("/.well-known/openid-configuration", handleAuthServerMetadata); // OIDC fallback
 
   // OAuth flow endpoints
   app.get("/oauth/authorize", handleAuthorize);
   app.get("/oauth/callback", handleCallback);
   app.post("/oauth/token", handleToken);
+  app.post("/oauth/register", handleRegister); // Dynamic client registration (RFC 7591)
 }

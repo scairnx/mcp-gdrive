@@ -74,9 +74,11 @@ async function createApp(): Promise<express.Application> {
     maxAge: 86400 // 24 hours
   }));
 
-  // Request logging
+  // Request logging with details for debugging
   app.use((req: Request, res: Response, next: NextFunction) => {
-    console.error(`${new Date().toISOString()} ${req.method} ${req.path}`);
+    const ua = req.get('user-agent') || 'none';
+    const origin = req.get('origin') || 'none';
+    console.error(`${new Date().toISOString()} ${req.method} ${req.path} [origin=${origin}] [ua=${ua.substring(0, 80)}]`);
     next();
   });
 
