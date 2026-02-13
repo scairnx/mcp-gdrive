@@ -539,8 +539,9 @@ export async function oauthMiddleware(
     console.error("No Authorization header - returning 401 to trigger OAuth discovery");
     const serverUrl = getServerUrl(req);
     const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    const scopesParam = SCOPES.join(" ");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="${scopesParam}"`);
     res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
     return res.status(401).json({
       error: "invalid_token",
@@ -552,8 +553,9 @@ export async function oauthMiddleware(
   if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
     const serverUrl = getServerUrl(req);
     const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    const scopesParam = SCOPES.join(" ");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="${scopesParam}"`);
     res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
     return res.status(401).json({
       error: "invalid_token",
@@ -594,8 +596,9 @@ export async function oauthMiddleware(
     console.error("Token validation error:", error);
     const serverUrl = getServerUrl(req);
     const resourceMetadataUrl = `${serverUrl}/.well-known/oauth-protected-resource`;
+    const scopesParam = SCOPES.join(" ");
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}"`);
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${resourceMetadataUrl}", scope="${scopesParam}"`);
     res.setHeader("Link", `<${resourceMetadataUrl}>; rel="oauth-protected-resource"`);
     return res.status(401).json({
       error: "invalid_token",
