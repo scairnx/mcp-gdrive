@@ -626,6 +626,9 @@ export function setupOAuthRoutes(app: any): void {
   app.get("/.well-known/oauth-protected-resource", handleOAuthMetadata);
   // Path-specific metadata for mcp-go SDK resource ID-based discovery (RFC 9728)
   app.get("/.well-known/oauth-protected-resource/mcp", handleOAuthMetadata);
+  // Workaround for buggy MCP clients that double-nest the well-known path
+  // See: https://github.com/google-gemini/gemini-cli/issues/18760
+  app.get("/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource", handleOAuthMetadata);
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
   app.get("/.well-known/openid-configuration", handleAuthServerMetadata); // OIDC fallback
 
