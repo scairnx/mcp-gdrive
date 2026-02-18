@@ -17,9 +17,14 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const transports: Record<string, StreamableHTTPServerTransport | SSEServerTransport> = {};
 
 /**
- * Create and configure the MCP server with OAuth authentication
+ * Create and configure the MCP server with OAuth authentication.
+ *
+ * The auth provider closes over the transport instance so it can read
+ * _currentRequest, which is set to the active HTTP request before each
+ * call to transport.handleRequest(). This is necessary because the MCP
+ * SDK invokes tool handlers asynchronously with no access to HTTP context.
  */
-function createMcpServer(): Server {
+function createMcpServer(transport: { _currentRequest?: Request }): Server {
   const server = new Server(
     {
       name: "mcp-gdrive-server",
@@ -33,20 +38,20 @@ function createMcpServer(): Server {
     },
   );
 
-  // Register handlers with OAuth auth provider
-  registerHandlers(server, (req?: Request) => {
+  // Auth provider reads the current HTTP request from the transport closure.
+  // _currentRequest is set in mcpHandler before handleRequest() is called and
+  // cleared afterwards, so it always reflects the in-flight HTTP request.
+  registerHandlers(server, () => {
+    const req = transport._currentRequest;
     if (!req) {
-      throw new Error("Request object required for authentication");
+      throw new Error("No active request context — cannot authenticate");
     }
-
-    // Get OAuth authenticated client from request
     const authClient = (req as any).authClient;
     if (!authClient) {
       throw new Error(
         "No OAuth authentication found. Provide Bearer token in Authorization header."
       );
     }
-
     console.error(`Using OAuth authentication for user: ${(req as any).userId}`);
     return authClient;
   });
@@ -147,7 +152,7 @@ async function createApp(): Promise<express.Application> {
         };
 
         // Connect the transport to the MCP server
-        const server = createMcpServer();
+        const server = createMcpServer(transport as any);
         await server.connect(transport);
       } else {
         // Invalid request - no session ID or not initialization request
@@ -201,7 +206,7 @@ async function createApp(): Promise<express.Application> {
         delete transports[transport.sessionId];
       });
 
-      const server = createMcpServer();
+      const server = createMcpServer(transport as any);
       await server.connect(transport);
       console.error(`SSE: Session ${transport.sessionId} established`);
     } catch (error: any) {
@@ -233,7 +238,9 @@ async function createApp(): Promise<express.Application> {
         });
       }
 
+      (transport as any)._currentRequest = req;
       await transport.handlePostMessage(req, res, req.body);
+      delete (transport as any)._currentRequest;
     } catch (error: any) {
       console.error("SSE: Error handling message:", error);
       if (!res.headersSent) {
