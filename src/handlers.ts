@@ -339,6 +339,7 @@ export function registerHandlers(
     const text = (s: string) => ({ content: [{ type: "text", text: s }], isError: false });
     const err = (s: string) => ({ content: [{ type: "text", text: `Error: ${s}` }], isError: true });
 
+    try {
     switch (request.params.name) {
 
       // ── search ─────────────────────────────────────────────────────────────
@@ -590,7 +591,15 @@ export function registerHandlers(
       }
 
       default:
-        throw new Error(`Unknown tool: ${request.params.name}`);
+        return err(`Unknown tool: ${request.params.name}`);
+    }
+    } catch (e: any) {
+      // Extract the most useful error message from Google API errors
+      const message = e?.errors?.[0]?.message || e?.message || String(e);
+      const status = e?.status || e?.code;
+      const detail = status ? `[${status}] ${message}` : message;
+      console.error(`Tool '${request.params.name}' error:`, detail);
+      return err(detail);
     }
   });
 }
