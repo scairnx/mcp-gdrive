@@ -124,6 +124,8 @@ function validatePkce(codeVerifier: string, codeChallenge: string, codeChallenge
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
+  // No-cache so CloudFront/proxies don't serve stale metadata
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.json({
     resource: serverUrl,
     // CRITICAL FIX: Use issuer URL (serverUrl), not the metadata URL
@@ -145,6 +147,7 @@ export function handleOAuthMetadata(req: Request, res: Response): void {
 export async function handleAuthServerMetadata(req: Request, res: Response): Promise<void> {
   const serverUrl = getServerUrl(req);
 
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.json({
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
@@ -174,6 +177,7 @@ export async function handleAuthServerMetadata(req: Request, res: Response): Pro
 export async function handleOidcConfiguration(req: Request, res: Response): Promise<void> {
   const serverUrl = getServerUrl(req);
 
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.json({
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
