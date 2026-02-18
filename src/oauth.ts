@@ -10,9 +10,9 @@ import { loadOAuthKeys } from "./auth.js";
 import crypto from "crypto";
 
 // Scopes we advertise to MCP clients (resource access scopes)
+// Full drive scope enables read + write + delete operations
 const SCOPES = [
-  "https://www.googleapis.com/auth/drive.readonly",
-  "https://www.googleapis.com/auth/drive.metadata.readonly"
+  "https://www.googleapis.com/auth/drive"
 ];
 
 // Additional OIDC scopes we always request from Google so we can provide id_token and userinfo
