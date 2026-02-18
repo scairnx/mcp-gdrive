@@ -43,8 +43,34 @@ const authorizationCodes = new Map<string, {
   codeChallengeMethod?: string;
   redirectUri?: string;
 }>();
-const userTokens = new Map<string, { access_token: string; refresh_token?: string; expiry_date?: number }>();
 const registeredClients = new Map<string, { client_id: string; redirect_uris?: string[]; client_name?: string; timestamp: number }>();
+
+/**
+ * Long-lived session tokens issued to MCP clients.
+ *
+ * Problem: Google access tokens expire in 1 hour. If we pass them directly to
+ * Claude/TextQL, the client loses access every hour and must re-authenticate.
+ * Claude's MCP integration may not gracefully handle this re-auth, forcing the
+ * user to manually visit the OAuth URL.
+ *
+ * Solution: Issue our own opaque UUID session tokens that last 30 days. We store
+ * the Google credentials (access + refresh token) server-side and transparently
+ * refresh them when they expire. The client never sees an expiry.
+ */
+const sessionTokens = new Map<string, {
+  googleAccessToken: string;
+  googleRefreshToken?: string;
+  googleExpiryDate?: number;
+  email?: string;
+  createdAt: number;
+}>();
+
+function cleanupSessionTokens(): void {
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  for (const [key, value] of sessionTokens.entries()) {
+    if (value.createdAt < thirtyDaysAgo) sessionTokens.delete(key);
+  }
+}
 
 /**
  * Get the server's public URL
@@ -521,17 +547,26 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
       authorizationCodes.delete(code);
 
       const tokens = authData.tokens;
-      const expiresIn = tokens.expiry_date
-        ? Math.floor((tokens.expiry_date - Date.now()) / 1000)
-        : 3600;
 
-      console.error(`Token exchange successful: Returning Google tokens to client`);
+      // Issue our own long-lived session token (30 days).
+      // We store the Google credentials server-side and refresh them transparently
+      // so clients never experience the 1-hour Google token expiry.
+      const sessionToken = crypto.randomUUID();
+      sessionTokens.set(sessionToken, {
+        googleAccessToken: tokens.access_token,
+        googleRefreshToken: tokens.refresh_token,
+        googleExpiryDate: tokens.expiry_date,
+        createdAt: Date.now()
+      });
+      cleanupSessionTokens();
+
+      console.error(`Token exchange successful: Issued session token (30-day), Google refresh token: ${!!tokens.refresh_token}`);
 
       const tokenResponse: any = {
-        access_token: tokens.access_token,
+        access_token: sessionToken,      // our long-lived token
         token_type: "Bearer",
-        expires_in: expiresIn > 0 ? expiresIn : 3600,
-        refresh_token: tokens.refresh_token,
+        expires_in: 30 * 24 * 3600,     // 30 days
+        refresh_token: sessionToken,     // same token doubles as refresh token
         scope: SCOPES.join(" ")
       };
 
@@ -549,6 +584,28 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
         });
       }
 
+      // Check if this is one of our session tokens
+      const session = sessionTokens.get(refresh_token);
+      if (session) {
+        if (session.googleRefreshToken) {
+          // Silently refresh the underlying Google token
+          const oauth2Client = await createOAuthClient(req);
+          oauth2Client.setCredentials({ refresh_token: session.googleRefreshToken });
+          const { credentials } = await oauth2Client.refreshAccessToken();
+          session.googleAccessToken = credentials.access_token!;
+          session.googleExpiryDate = credentials.expiry_date || undefined;
+          console.error(`Session token refreshed underlying Google credential`);
+        }
+        // Return the same session token — client keeps the same token forever
+        return res.json({
+          access_token: refresh_token,
+          token_type: "Bearer",
+          expires_in: 30 * 24 * 3600,
+          scope: SCOPES.join(" ")
+        });
+      }
+
+      // Legacy: direct Google refresh token (backwards compat)
       const oauth2Client = await createOAuthClient(req);
       oauth2Client.setCredentials({ refresh_token });
       const { credentials } = await oauth2Client.refreshAccessToken();
@@ -560,7 +617,6 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
         scope: SCOPES.join(" ")
       };
 
-      // Include id_token if returned by Google on refresh
       if (credentials.id_token) {
         refreshResponse.id_token = credentials.id_token;
       }
@@ -716,8 +772,45 @@ export async function oauthMiddleware(
   const token = parts[1];
 
   try {
-    // Create OAuth client with the token
     const oauth2Client = await createOAuthClient(req);
+
+    // Check if this is one of our long-lived session tokens
+    const session = sessionTokens.get(token);
+    if (session) {
+      // Transparently refresh the Google credential if it's about to expire (within 5 min)
+      const needsRefresh = session.googleExpiryDate
+        ? Date.now() > session.googleExpiryDate - 5 * 60 * 1000
+        : false;
+
+      if (needsRefresh && session.googleRefreshToken) {
+        try {
+          oauth2Client.setCredentials({ refresh_token: session.googleRefreshToken });
+          const { credentials } = await oauth2Client.refreshAccessToken();
+          session.googleAccessToken = credentials.access_token!;
+          session.googleExpiryDate = credentials.expiry_date || undefined;
+          console.error(`Transparently refreshed Google token for session`);
+        } catch (refreshErr: any) {
+          console.error(`Failed to refresh Google token: ${refreshErr.message}`);
+          // Fall through — let the existing token attempt proceed
+        }
+      }
+
+      oauth2Client.setCredentials({ access_token: session.googleAccessToken });
+
+      // Verify the underlying Google token is still valid
+      const tokenInfo = await oauth2Client.getTokenInfo(session.googleAccessToken);
+      if (tokenInfo.email) session.email = tokenInfo.email;
+
+      (req as any).authClient = oauth2Client;
+      (req as any).accessToken = session.googleAccessToken;
+      (req as any).userId = tokenInfo.email || session.email || "authenticated-user";
+      (req as any).authMethod = "oauth";
+
+      console.error(`OAuth authentication successful for: ${(req as any).userId}`);
+      return next();
+    }
+
+    // Direct Google token (legacy / manual auth flows)
     oauth2Client.setCredentials({ access_token: token });
 
     // Verify token by getting token info
