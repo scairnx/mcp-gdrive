@@ -875,6 +875,8 @@ export function setupOAuthRoutes(app: any): void {
 
   // OAuth 2.0 Authorization Server Metadata (RFC 8414)
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
+  // Path-specific metadata for clients that append the MCP path (RFC 8414 §3.1)
+  app.get("/.well-known/oauth-authorization-server/mcp", handleAuthServerMetadata);
 
   // OpenID Connect Discovery (OIDC Discovery 1.0)
   // Required by MCP SDK as fallback when OAuth AS metadata fails
