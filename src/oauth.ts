@@ -9,10 +9,17 @@ import { OAuth2Client } from "google-auth-library";
 import { loadOAuthKeys } from "./auth.js";
 import crypto from "crypto";
 
+// Scopes we advertise to MCP clients (resource access scopes)
 const SCOPES = [
   "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/drive.metadata.readonly"
 ];
+
+// Additional OIDC scopes we always request from Google so we can provide id_token and userinfo
+const OIDC_SCOPES = ["openid", "email", "profile"];
+
+// All scopes requested from Google (OIDC + resource)
+const GOOGLE_SCOPES = [...SCOPES, ...OIDC_SCOPES];
 
 // In-memory storage for OAuth state and tokens
 // In production, use Redis or a database
@@ -21,10 +28,20 @@ const oauthStates = new Map<string, {
   clientId?: string;
   clientRedirectUri?: string;
   clientState?: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
 }>();
 const authorizationCodes = new Map<string, {
   timestamp: number;
-  tokens: { access_token: string; refresh_token?: string; expiry_date?: number };
+  tokens: {
+    access_token: string;
+    refresh_token?: string;
+    expiry_date?: number;
+    id_token?: string;
+  };
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+  redirectUri?: string;
 }>();
 const userTokens = new Map<string, { access_token: string; refresh_token?: string; expiry_date?: number }>();
 const registeredClients = new Map<string, { client_id: string; redirect_uris?: string[]; client_name?: string; timestamp: number }>();
@@ -84,22 +101,35 @@ async function createOAuthClient(req: Request): Promise<OAuth2Client> {
 }
 
 /**
+ * Validate PKCE code_verifier against stored code_challenge
+ */
+function validatePkce(codeVerifier: string, codeChallenge: string, codeChallengeMethod: string): boolean {
+  if (codeChallengeMethod === 'S256') {
+    const hash = crypto.createHash('sha256').update(codeVerifier).digest();
+    const computed = hash.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    return computed === codeChallenge;
+  } else if (codeChallengeMethod === 'plain') {
+    return codeVerifier === codeChallenge;
+  }
+  return false;
+}
+
+/**
  * OAuth Protected Resource Metadata (RFC 9728)
  * /.well-known/oauth-protected-resource
  *
- * Points to our own server which proxies Google OAuth metadata
- * This allows TextQL to discover OAuth 2.1 metadata even though
- * Google only exposes OpenID Connect metadata
+ * IMPORTANT: authorization_servers must contain the ISSUER URL (base URL),
+ * NOT the metadata URL. The MCP SDK derives the metadata URL from the issuer.
  */
 export function handleOAuthMetadata(req: Request, res: Response): void {
   const serverUrl = getServerUrl(req);
 
-  // RFC 9728 OAuth Protected Resource Metadata - STRICTLY COMPLIANT
-  // The mcp-go SDK expects ONLY RFC 9728 fields here, not mixed with RFC 8414
-  // Authorization server metadata MUST be fetched separately from authorization_servers URL
   res.json({
     resource: serverUrl,
-    authorization_servers: [`${serverUrl}/.well-known/oauth-authorization-server`],
+    // CRITICAL FIX: Use issuer URL (serverUrl), not the metadata URL
+    // The MCP SDK calls discoverAuthorizationServerMetadata(authorization_servers[0])
+    // and builds /.well-known/oauth-authorization-server from this base URL
+    authorization_servers: [serverUrl],
     bearer_methods_supported: ["header"],
     scopes_supported: SCOPES
   });
@@ -110,16 +140,16 @@ export function handleOAuthMetadata(req: Request, res: Response): void {
  * /.well-known/oauth-authorization-server
  *
  * Acts as OAuth authorization server proxy for Google Drive.
- * MCP clients (like TextQL) can complete the full OAuth dance through our server.
+ * MCP clients (like Claude, TextQL) can complete the full OAuth dance through our server.
  */
 export async function handleAuthServerMetadata(req: Request, res: Response): Promise<void> {
   const serverUrl = getServerUrl(req);
 
-  // Point to OUR endpoints - we proxy the OAuth flow to Google
   res.json({
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
     token_endpoint: `${serverUrl}/oauth/token`,
+    userinfo_endpoint: `${serverUrl}/oauth/userinfo`,
     registration_endpoint: `${serverUrl}/oauth/register`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
@@ -130,18 +160,89 @@ export async function handleAuthServerMetadata(req: Request, res: Response): Pro
 }
 
 /**
+ * OpenID Connect Discovery (OIDC Discovery 1.0)
+ * /.well-known/openid-configuration
+ *
+ * Full OIDC discovery document with required fields.
+ * Required fields per MCP SDK's OpenIdProviderDiscoveryMetadataSchema:
+ * - jwks_uri (REQUIRED)
+ * - subject_types_supported (REQUIRED)
+ * - id_token_signing_alg_values_supported (REQUIRED)
+ *
+ * We proxy Google's OIDC and use Google's JWKS endpoint for token validation.
+ */
+export async function handleOidcConfiguration(req: Request, res: Response): Promise<void> {
+  const serverUrl = getServerUrl(req);
+
+  res.json({
+    issuer: serverUrl,
+    authorization_endpoint: `${serverUrl}/oauth/authorize`,
+    token_endpoint: `${serverUrl}/oauth/token`,
+    userinfo_endpoint: `${serverUrl}/oauth/userinfo`,
+    // Google's JWKS - used to validate id_tokens we proxy from Google
+    jwks_uri: "https://www.googleapis.com/oauth2/v3/certs",
+    registration_endpoint: `${serverUrl}/oauth/register`,
+    response_types_supported: ["code"],
+    subject_types_supported: ["public"],
+    id_token_signing_alg_values_supported: ["RS256"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    token_endpoint_auth_methods_supported: ["none"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    scopes_supported: [...SCOPES, "openid", "email", "profile"],
+    claims_supported: ["sub", "iss", "aud", "exp", "iat", "email", "email_verified", "name", "picture"]
+  });
+}
+
+/**
+ * OIDC Userinfo Endpoint
+ * GET /oauth/userinfo
+ *
+ * Proxies to Google's userinfo endpoint using the Bearer token.
+ * Returns user identity claims.
+ */
+export async function handleUserInfo(req: Request, res: Response): Promise<any> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.setHeader('WWW-Authenticate', 'Bearer realm="mcp-gdrive"');
+    return res.status(401).json({ error: 'invalid_token', error_description: 'Bearer token required' });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    // Proxy to Google's userinfo endpoint
+    const googleResponse = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    if (!googleResponse.ok) {
+      res.setHeader('WWW-Authenticate', 'Bearer realm="mcp-gdrive", error="invalid_token"');
+      return res.status(401).json({ error: 'invalid_token', error_description: 'Token invalid or expired' });
+    }
+
+    const userInfo = await googleResponse.json();
+    return res.json(userInfo);
+  } catch (error: any) {
+    console.error("Userinfo error:", error);
+    return res.status(500).json({ error: 'server_error', error_description: error.message });
+  }
+}
+
+/**
  * OAuth Authorization Endpoint
  * GET /oauth/authorize
  *
- * Accepts authorization request from MCP client (e.g., TextQL)
+ * Accepts authorization request from MCP client (e.g., Claude, TextQL)
  * Redirects user to Google's OAuth consent screen
- * Stores client's redirect_uri to send them the authorization code later
+ * Stores client's redirect_uri and PKCE challenge to complete the flow later
  */
 export async function handleAuthorize(req: Request, res: Response): Promise<any> {
   try {
     const clientRedirectUri = req.query.redirect_uri as string;
     const clientState = req.query.state as string;
     const responseType = req.query.response_type as string;
+    const codeChallenge = req.query.code_challenge as string;
+    const codeChallengeMethod = (req.query.code_challenge_method as string) || 'plain';
 
     // Validate required OAuth parameters
     if (responseType && responseType !== "code") {
@@ -158,8 +259,10 @@ export async function handleAuthorize(req: Request, res: Response): Promise<any>
     oauthStates.set(state, {
       timestamp: Date.now(),
       clientId: req.query.client_id as string,
-      clientRedirectUri: clientRedirectUri, // Store where to redirect back
-      clientState: clientState // Store client's state to return it
+      clientRedirectUri: clientRedirectUri,
+      clientState: clientState,
+      codeChallenge: codeChallenge,
+      codeChallengeMethod: codeChallengeMethod
     });
 
     // Clean up old states (older than 10 minutes)
@@ -171,14 +274,15 @@ export async function handleAuthorize(req: Request, res: Response): Promise<any>
     }
 
     // Generate authorization URL to redirect to Google
+    // Include OIDC scopes so Google returns id_token
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: "offline",
-      scope: SCOPES,
+      scope: GOOGLE_SCOPES,
       state: state,
       prompt: "consent" // Force consent screen to get refresh token
     });
 
-    console.error(`OAuth authorize: redirecting to Google (client redirect: ${clientRedirectUri})`);
+    console.error(`OAuth authorize: redirecting to Google (client redirect: ${clientRedirectUri}, PKCE: ${!!codeChallenge})`);
     res.redirect(authUrl);
   } catch (error: any) {
     console.error("Authorization error:", error);
@@ -230,12 +334,14 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
     const oauthState = oauthStates.get(state as string)!;
     const clientRedirectUri = oauthState.clientRedirectUri;
     const clientState = oauthState.clientState;
+    const codeChallenge = oauthState.codeChallenge;
+    const codeChallengeMethod = oauthState.codeChallengeMethod;
 
     // Exchange code for tokens with Google
     const oauth2Client = await createOAuthClient(req);
     const { tokens } = await oauth2Client.getToken(code as string);
 
-    console.error(`OAuth callback: Got tokens from Google. Client redirect: ${clientRedirectUri}`);
+    console.error(`OAuth callback: Got tokens from Google (has id_token: ${!!tokens.id_token}, client redirect: ${clientRedirectUri})`);
 
     // Clean up state
     oauthStates.delete(state as string);
@@ -246,13 +352,18 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
       const authCode = crypto.randomBytes(32).toString("hex");
 
       // Store the tokens with the auth code (valid for 10 minutes)
+      // Also store PKCE challenge to validate at token endpoint
       authorizationCodes.set(authCode, {
         timestamp: Date.now(),
         tokens: {
           access_token: tokens.access_token!,
           refresh_token: tokens.refresh_token || undefined,
-          expiry_date: tokens.expiry_date || undefined
-        }
+          expiry_date: tokens.expiry_date || undefined,
+          id_token: tokens.id_token || undefined
+        },
+        codeChallenge: codeChallenge,
+        codeChallengeMethod: codeChallengeMethod,
+        redirectUri: clientRedirectUri
       });
 
       // Clean up old authorization codes
@@ -327,7 +438,8 @@ export async function handleCallback(req: Request, res: Response): Promise<any> 
  * POST /oauth/token
  *
  * Exchanges authorization code or refresh token for access token
- * Accepts OUR authorization codes from the callback redirect
+ * Validates PKCE code_verifier if code_challenge was provided
+ * Passes through Google's id_token for OIDC support
  */
 export async function handleToken(req: Request, res: Response): Promise<any> {
   try {
@@ -355,7 +467,7 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
       });
     }
 
-    const { grant_type, code, refresh_token } = body;
+    const { grant_type, code, refresh_token, code_verifier } = body;
 
     if (!grant_type) {
       return res.status(400).json({
@@ -382,6 +494,25 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
         });
       }
 
+      // Validate PKCE code_verifier if a code_challenge was stored
+      if (authData.codeChallenge) {
+        if (!code_verifier) {
+          return res.status(400).json({
+            error: "invalid_grant",
+            error_description: "code_verifier is required (PKCE)"
+          });
+        }
+        const method = authData.codeChallengeMethod || 'S256';
+        if (!validatePkce(code_verifier, authData.codeChallenge, method)) {
+          console.error(`Token exchange failed: PKCE code_verifier mismatch`);
+          return res.status(400).json({
+            error: "invalid_grant",
+            error_description: "code_verifier does not match code_challenge"
+          });
+        }
+        console.error(`Token exchange: PKCE validation passed`);
+      }
+
       // Delete the authorization code (one-time use)
       authorizationCodes.delete(code);
 
@@ -392,13 +523,20 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
 
       console.error(`Token exchange successful: Returning Google tokens to client`);
 
-      return res.json({
+      const tokenResponse: any = {
         access_token: tokens.access_token,
         token_type: "Bearer",
         expires_in: expiresIn > 0 ? expiresIn : 3600,
         refresh_token: tokens.refresh_token,
         scope: SCOPES.join(" ")
-      });
+      };
+
+      // Include id_token if available (OIDC support)
+      if (tokens.id_token) {
+        tokenResponse.id_token = tokens.id_token;
+      }
+
+      return res.json(tokenResponse);
     } else if (grant_type === "refresh_token") {
       if (!refresh_token) {
         return res.status(400).json({
@@ -411,12 +549,19 @@ export async function handleToken(req: Request, res: Response): Promise<any> {
       oauth2Client.setCredentials({ refresh_token });
       const { credentials } = await oauth2Client.refreshAccessToken();
 
-      return res.json({
+      const refreshResponse: any = {
         access_token: credentials.access_token,
         token_type: "Bearer",
         expires_in: credentials.expiry_date ? Math.floor((credentials.expiry_date - Date.now()) / 1000) : 3600,
         scope: SCOPES.join(" ")
-      });
+      };
+
+      // Include id_token if returned by Google on refresh
+      if (credentials.id_token) {
+        refreshResponse.id_token = credentials.id_token;
+      }
+
+      return res.json(refreshResponse);
     } else {
       return res.status(400).json({
         error: "unsupported_grant_type",
@@ -522,6 +667,7 @@ export async function oauthMiddleware(
     "/oauth/callback",
     "/oauth/token",
     "/oauth/register",
+    "/oauth/userinfo",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration"
@@ -587,6 +733,7 @@ export async function oauthMiddleware(
 
     // Attach authenticated client to request
     (req as any).authClient = oauth2Client;
+    (req as any).accessToken = token;
     (req as any).userId = tokenInfo.email || "authenticated-user";
     (req as any).authMethod = "oauth";
 
@@ -627,14 +774,24 @@ export function setupOAuthRoutes(app: any): void {
   // Path-specific metadata for mcp-go SDK resource ID-based discovery (RFC 9728)
   app.get("/.well-known/oauth-protected-resource/mcp", handleOAuthMetadata);
   // Workaround for buggy MCP clients that double-nest the well-known path
-  // See: https://github.com/google-gemini/gemini-cli/issues/18760
   app.get("/.well-known/oauth-protected-resource/.well-known/oauth-protected-resource", handleOAuthMetadata);
+
+  // OAuth 2.0 Authorization Server Metadata (RFC 8414)
   app.get("/.well-known/oauth-authorization-server", handleAuthServerMetadata);
-  app.get("/.well-known/openid-configuration", handleAuthServerMetadata); // OIDC fallback
+
+  // OpenID Connect Discovery (OIDC Discovery 1.0)
+  // Required by MCP SDK as fallback when OAuth AS metadata fails
+  // Also handles OIDC-specific paths the SDK tries
+  app.get("/.well-known/openid-configuration", handleOidcConfiguration);
+  app.get("/.well-known/openid-configuration/mcp", handleOidcConfiguration);
 
   // OAuth flow endpoints (handlers parse body manually due to MCP SDK app conflicts)
   app.get("/oauth/authorize", handleAuthorize);
   app.get("/oauth/callback", handleCallback);
   app.post("/oauth/token", handleToken);
   app.post("/oauth/register", handleRegister);
+
+  // OIDC Userinfo endpoint
+  app.get("/oauth/userinfo", handleUserInfo);
+  app.post("/oauth/userinfo", handleUserInfo); // Some clients use POST
 }
