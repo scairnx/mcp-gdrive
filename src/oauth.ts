@@ -140,6 +140,14 @@ function validatePkce(codeVerifier: string, codeChallenge: string, codeChallenge
   return false;
 }
 
+function sendStrictJson(res: Response, payload: unknown): void {
+  // Some OAuth client libraries require an exact application/json media type
+  // and reject charset parameters like "application/json; charset=utf-8".
+  const body = JSON.stringify(payload);
+  res.setHeader("Content-Type", "application/json");
+  res.send(Buffer.from(body, "utf8"));
+}
+
 /**
  * OAuth Protected Resource Metadata (RFC 9728)
  * /.well-known/oauth-protected-resource
@@ -152,7 +160,7 @@ export function handleOAuthMetadata(req: Request, res: Response): void {
 
   // No-cache so CloudFront/proxies don't serve stale metadata
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  res.json({
+  sendStrictJson(res, {
     resource: serverUrl,
     // CRITICAL FIX: Use issuer URL (serverUrl), not the metadata URL
     // The MCP SDK calls discoverAuthorizationServerMetadata(authorization_servers[0])
@@ -174,7 +182,7 @@ export async function handleAuthServerMetadata(req: Request, res: Response): Pro
   const serverUrl = getServerUrl(req);
 
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  res.json({
+  sendStrictJson(res, {
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
     token_endpoint: `${serverUrl}/oauth/token`,
@@ -204,7 +212,7 @@ export async function handleOidcConfiguration(req: Request, res: Response): Prom
   const serverUrl = getServerUrl(req);
 
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-  res.json({
+  sendStrictJson(res, {
     issuer: serverUrl,
     authorization_endpoint: `${serverUrl}/oauth/authorize`,
     token_endpoint: `${serverUrl}/oauth/token`,
